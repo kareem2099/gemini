@@ -1,10 +1,13 @@
 import google.generativeai as genai
 import os
 import logging
-import io # Import io for handling image bytes
+import asyncio # Import asyncio at the top level
+import io # Re-import io for handle_photo
 from dotenv import load_dotenv # Import load_dotenv
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton # Import InlineKeyboardMarkup and InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler # Import CallbackQueryHandler
+from voice_utils import send_audio_response, handle_voice as voice_utils_handle_voice # Import voice utilities
+from menu_utils import menu, menu_button_handler as menu_utils_button_handler # Import menu utilities
 
 # Load environment variables from .env file
 load_dotenv()
@@ -48,6 +51,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [
             InlineKeyboardButton("Русский (ru)", callback_data="lang_ru"),
             InlineKeyboardButton("English (en)", callback_data="lang_en"),
+        ],
+        [
+            InlineKeyboardButton("العربية (ar)", callback_data="lang_ar"),
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -86,8 +92,10 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             prompt = f"{prompt_prefix} User message: {user_message}"
             
         response = chat.send_message(prompt)
-        await update.message.reply_text(response.text)
-        logger.info(f"Gemini response: {response.text}")
+        gemini_text = response.text
+        await update.message.reply_text(gemini_text) # Send text response
+        await send_audio_response(update, gemini_text, language) # Send audio response
+        logger.info(f"Gemini response: {gemini_text}")
     except Exception as e:
         logger.error(f"An error occurred: {e}")
         await update.message.reply_text("An error occurred while processing your request. Please try again later.")
@@ -121,12 +129,46 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         
         # Send both text and image to Gemini
         response = chat.send_message([prompt_text, image_part])
-        await update.message.reply_text(response.text)
-        logger.info(f"Gemini response to photo: {response.text}")
+        gemini_text = response.text
+        await update.message.reply_text(gemini_text) # Send text response
+        await send_audio_response(update, gemini_text, language) # Send audio response
+        logger.info(f"Gemini response to photo: {gemini_text}")
 
     except Exception as e:
         logger.error(f"An error occurred while processing photo: {e}")
         await update.message.reply_text("An error occurred while processing your image. Please try again later.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message when the command /help is issued."""
+    help_text = (
+        "Here are the commands you can use:\n"
+        "/start - Start the bot and choose your language\n"
+        "/menu - Explore interactive options\n"
+        "/help - Show this list of commands\n\n"
+        "You can also send me text messages, photos, or voice messages, and I will respond using Gemini AI."
+    )
+    await update.message.reply_text(help_text)
+    await send_audio_response(update, help_text, user_languages.get(update.effective_user.id, "en")) # Send audio help
+
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle voice messages by transcribing them and then sending to Gemini."""
+    transcribed_text = await voice_utils_handle_voice(update, context, user_languages)
+    if transcribed_text:
+        user_id = update.effective_user.id
+        language = user_languages.get(user_id, "en") # Get language again as it might be updated in voice_utils_handle_voice
+
+        try:
+            # Send transcribed text to Gemini
+            prompt_prefix = f"Respond in {language.upper()}."
+            prompt = f"{prompt_prefix} User voice message transcribed: {transcribed_text}"
+            response = chat.send_message(prompt)
+            gemini_text = response.text
+            await update.message.reply_text(gemini_text) # Send text response
+            await send_audio_response(update, gemini_text, language) # Send audio response
+            logger.info(f"Gemini response to voice: {gemini_text}")
+        except Exception as e:
+            logger.error(f"An error occurred during Gemini interaction after voice transcription: {e}")
+            await update.message.reply_text("An error occurred while processing your voice message with Gemini. Please try again later.")
 
 def main() -> None:
     """Start the bot."""
@@ -134,15 +176,30 @@ def main() -> None:
 
     # On different commands - answer in Telegram
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("menu", menu))
+    application.add_handler(CommandHandler("help", help_command))
 
     # On callback queries (for language selection)
     application.add_handler(CallbackQueryHandler(button, pattern="^lang_"))
+    application.add_handler(CallbackQueryHandler(lambda update, context: menu_utils_button_handler(update, context, user_languages), pattern="^menu_"))
 
     # On non-command messages - echo the message
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
     
     # On photo messages - handle photo
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    # On voice messages - handle voice
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+
+    # Define the async function to set bot commands
+    async def post_init_commands(app: Application):
+        await app.bot.set_my_commands([
+            ("start", "Start the bot and choose your language"),
+            ("menu", "Explore interactive options"),
+            ("help", "Show available commands"),
+        ])
+        logger.info("Bot commands set.")
 
     # Run the bot until the user presses Ctrl-C
     logger.info("Bot started. Press Ctrl-C to stop.")
